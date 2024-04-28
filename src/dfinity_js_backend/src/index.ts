@@ -1,4 +1,3 @@
-import { request } from "@dfinity/agent/lib/cjs/canisterStatus";
 import {
   query,
   update,
@@ -51,7 +50,7 @@ const CollateralPayload = Record({
 
 // Structure representing a borrower
 const Borrower = Record({
-  id: text,
+  id: Principal,
   principal: Principal,
   name: text,
   email: text,
@@ -130,7 +129,7 @@ const BorrowerPayload = Record({
 
 // Payload structure for updating a borrower
 const UpdateBorrowerPayload = Record({
-  id: text,
+  id: Principal,
   name: text,
   email: text,
   creditScore: nat64,
@@ -198,6 +197,8 @@ const ErrorType = Variant({
   InvalidPayload: text,
   PaymentFailed: text,
   PaymentCompleted: text,
+  AlreadyRegistered: text,
+  AuthenticationFailed: text
 });
 
 /**
@@ -219,7 +220,7 @@ const ErrorType = Variant({
  */
 const loansStorage = StableBTreeMap(0, text, Loan);
 const lendersStorage = StableBTreeMap(1, text, Lender);
-const borrowersStorage = StableBTreeMap(3, text, Borrower);
+const borrowersStorage = StableBTreeMap(3, Principal, Borrower);
 const pendingPayments = StableBTreeMap(4, nat64, ReservePayment);
 const pendingRepayments = StableBTreeMap(9, nat64, ReserveRePayment);
 const collateralStorage = StableBTreeMap(5, text, Collateral);
@@ -243,19 +244,26 @@ export default Canister({
     }
 
     // get borrower with the same principal
-    const borrowerOpt = borrowersStorage.values().filter((borrower) => {
-      return borrower.principal.toText() === ic.caller().toText();
-    });
+    const borrowerOpt = borrowersStorage.get(ic.caller());
+    if ("None" in borrowerOpt) {
+      return Err({ NotFound: `Caller isn't a borrower.` });
+    }
 
     // const guarantorOpt = borrowersStorage.get(payload.guarantorId);
 
-    const borrower = borrowerOpt[0];
+    const borrower = borrowerOpt.Some;
     // const guarantor = guarantorOpt.Some;
 
     const lenderOpt = lendersStorage.get(payload.lenderId);
+    if ("None" in lenderOpt) {
+      return Err({ NotFound: `Lender with id=${payload.lenderId} not found.` });
+    }
     const lender = lenderOpt.Some;
 
     const collateralOpt = collateralStorage.get(payload.collateralId);
+    if ("None" in collateralOpt) {
+      return Err({ NotFound: `Collateral with id=${payload.collateralId} not found.` });
+    }
     const collateral = collateralOpt.Some;
     // Create an loan with a unique id generated using UUID v4
     const loan = {
@@ -311,7 +319,7 @@ export default Canister({
       const loan = loanOpt.Some;
       const updatedLoan = {
         ...loan,
-        ...payload,
+        description: payload.description,
       };
       loansStorage.insert(loan.id, updatedLoan);
       return Ok(updatedLoan);
@@ -360,9 +368,13 @@ export default Canister({
       if (typeof payload !== "object" || Object.keys(payload).length === 0) {
         return Err({ NotFound: "invalid payload" });
       }
+
+      if(borrowersStorage.containsKey(ic.caller())){
+        return Err({AlreadyRegistered: "Caller already have a borrower account."})
+      }
       // Create a borrower with a unique id generated using UUID v4
       const borrower = {
-        id: uuidv4(),
+        id: ic.caller(),
         principal: ic.caller(),
         loans: [],
         creditScore: 100n,
@@ -382,7 +394,7 @@ export default Canister({
   }),
 
   // Function get borrower by id
-  getBorrower: query([text], Result(Borrower, ErrorType), (id) => {
+  getBorrower: query([Principal], Result(Borrower, ErrorType), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
       return Err({ NotFound: `borrower with id=${id} not found` });
@@ -394,27 +406,25 @@ export default Canister({
   // get borrower by owner
   getBorrowerByOwner: query([], Result(Borrower, ErrorType), () => {
     const principal = ic.caller();
-    const borrowerOpt = borrowersStorage.values().filter((borrower) => {
-      return borrower.principal.toText() === principal.toText();
-    });
-    if (borrowerOpt.length === 0) {
+    const borrowerOpt = borrowersStorage.get(principal)
+    if ("None" in borrowerOpt) {
       return Err({
         NotFound: `borrower with principal=${principal} not found`,
       });
     }
-    return Ok(borrowerOpt[0]);
+    return Ok(borrowerOpt.Some);
   }),
 
   // get loans reserved by a borrower
-  getBorrowerLoans: query([text], Vec(Loan), (id) => {
+  getBorrowerLoans: query([Principal], Result(Vec(Loan), ErrorType), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
-      return [];
+      return Err({ NotFound: `borrower with id=${id} not found`});
     }
     const borrower = borrowerOpt.Some;
-    return loansStorage.values().filter((loan) => {
+    return Ok(loansStorage.values().filter((loan) => {
       return borrower.loans.includes(loan.id);
-    });
+    }));
   }),
 
   // add collateral
@@ -422,9 +432,11 @@ export default Canister({
     [CollateralPayload],
     Result(Collateral, ErrorType),
     (payload) => {
-      const borrower = borrowersStorage.values().filter((borrower) => {
-        return borrower.principal.toText() === ic.caller().toText();
-      })[0];
+      const borrowerOpt = borrowersStorage.get(ic.caller());
+      if ("None" in borrowerOpt) {
+        return Err({ NotFound: `Borrower with id=${ic.caller()} not found.` });
+      }
+      const borrower = borrowerOpt.Some;
       // Check if the payload is a valid object
       if (typeof payload !== "object" || Object.keys(payload).length === 0) {
         return Err({ NotFound: "invalid payload" });
@@ -456,6 +468,9 @@ export default Canister({
     [UpdateBorrowerPayload],
     Result(Borrower, ErrorType),
     (payload) => {
+      if(payload.id.toText() != ic.caller().toText()){
+        return Err({InvalidPayload: `Provided id needs to match with the caller's principal.`})
+      }
       const borrowerOpt = borrowersStorage.get(payload.id);
       if ("None" in borrowerOpt) {
         return Err({ NotFound: `borrower with id=${payload.id} not found` });
@@ -471,7 +486,7 @@ export default Canister({
   ),
 
   // get borrower collaterals
-  getBorrowerCollaterals: query([text], Vec(Collateral), (id) => {
+  getBorrowerCollaterals: query([Principal], Vec(Collateral), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
       return [];
@@ -486,38 +501,38 @@ export default Canister({
   }),
 
   // get borrower pending loans
-  getBorrowerPendingLoans: query([text], Vec(Loan), (id) => {
+  getBorrowerPendingLoans: query([Principal], Vec(Loan), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
       return [];
     }
     const borrower = borrowerOpt.Some;
     return loansStorage.values().filter((loan) => {
-      return loan.borrower.id === borrower.id && loan.status === "pending";
+      return loan.borrower.id.toString() === borrower.id.toString() && loan.status === "pending";
     });
   }),
 
   // get borrower active loans
-  getBorrowerActiveLoans: query([text], Vec(Loan), (id) => {
+  getBorrowerActiveLoans: query([Principal], Vec(Loan), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
       return [];
     }
     const borrower = borrowerOpt.Some;
     return loansStorage.values().filter((loan) => {
-      return loan.borrower.id === borrower.id && loan.status === "approved";
+      return loan.borrower.id.toString() === borrower.id.toString() && loan.status === "approved";
     });
   }),
 
   // get borrower completed loans
-  getBorrowerCompletedLoans: query([text], Vec(Loan), (id) => {
+  getBorrowerCompletedLoans: query([Principal], Vec(Loan), (id) => {
     const borrowerOpt = borrowersStorage.get(id);
     if ("None" in borrowerOpt) {
       return [];
     }
     const borrower = borrowerOpt.Some;
     return loansStorage.values().filter((loan) => {
-      return loan.borrower.id === borrower.id && loan.status === "completed";
+      return loan.borrower.id.toString() === borrower.id.toString() && loan.status === "completed";
     });
   }),
 
@@ -608,6 +623,9 @@ export default Canister({
         return Err({ NotFound: `lender with id=${payload.id} not found` });
       }
       const lender = lenderOpt.Some;
+      if(lender.principal.toString() != ic.caller().toString()){
+        return Err({AuthenticationFailed: "Caller isn't the lender's principal."})
+      }
       const updatedLender = {
         ...lender,
         ...payload,
@@ -618,14 +636,12 @@ export default Canister({
   ),
 
   // get borrower loans
-  getActiveLoans: query([], Vec(Loan), () => {
-    const borrowerOpt = borrowersStorage.values().filter((borrower) => {
-      return borrower.principal.toText() === ic.caller().toText();
-    });
-    if (borrowerOpt.length === 0) {
-      return [];
+  getActiveLoans: query([], Result(Vec(Loan), ErrorType), () => {
+    const borrowerOpt = borrowersStorage.get(ic.caller());
+    if ("None" in borrowerOpt) {
+      return Err({NotFound: `Caller isn't a registered borrower.`});
     }
-    const borrower = borrowerOpt[0];
+    const borrower = borrowerOpt.Some;
 
     const loans = loansStorage.values().filter((loan) => {
       return (
@@ -634,7 +650,7 @@ export default Canister({
       );
     });
 
-    return loans;
+    return Ok(loans);
   }),
 
   createPaymentPay: update(
@@ -652,7 +668,7 @@ export default Canister({
       const amount = loan.amount;
 
       const lenderId = loan.lender.Some;
-      // get lender
+      // get borrower
       const borrowerOpt = borrowersStorage.get(loan.borrower.id);
 
       const borrower = borrowerOpt.Some.principal;
@@ -793,9 +809,7 @@ export default Canister({
     [text, nat64],
     Result(ReserveSavings, ErrorType),
     (lenderId, amount) => {
-      const borrowerOpt = borrowersStorage.values().filter((borrower) => {
-        return borrower.principal.toText() === ic.caller().toText();
-      });
+      const borrowerOpt = borrowersStorage.get(ic.caller())
 
       console.log(amount);
 
@@ -808,7 +822,7 @@ export default Canister({
 
       const lender = lenderOpt.Some;
 
-      const borrower = borrowerOpt[0];
+      const borrower = borrowerOpt.Some;
 
       const reserveSavings = {
         price: amount,
